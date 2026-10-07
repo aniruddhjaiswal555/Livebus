@@ -1,0 +1,381 @@
+package com.example.livebus.ui.tracking
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import dagger.hilt.android.lifecycle.HiltViewModel
+import io.reactivex.disposables.CompositeDisposable
+import io.reactivex.functions.Consumer
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import ua.naiksoftware.stomp.Stomp
+import ua.naiksoftware.stomp.StompClient
+import javax.inject.Inject
+import org.json.JSONObject
+import io.reactivex.android.schedulers.AndroidSchedulers
+import io.reactivex.schedulers.Schedulers
+
+import com.example.livebus.BuildConfig
+import com.example.livebus.data.TransitRepository
+import com.example.livebus.data.OfflineTransitDao
+import com.example.livebus.data.GovtRoute
+import com.example.livebus.data.RouteStageSegment
+import io.reactivex.disposables.Disposable
+import kotlinx.coroutines.Job
+
+data class LatLng(val latitude: Double, val longitude: Double)
+
+data class RouteDetails(
+    val routeName: String = "Route 216W",
+    val destination: String = "IIIT Gachibowli",
+    val direction: String = "Westbound"
+)
+
+data class ActiveBus(
+    val busId: String,
+    val location: LatLng,
+    val etaMinutes: Int,
+    val distanceKm: Double,
+    val status: BusStatus
+)
+
+@HiltViewModel
+
+class LiveTrackingViewModel @Inject constructor(
+    private val transitRepository: TransitRepository,
+    private val offlineTransitDao: OfflineTransitDao
+) : ViewModel() {
+
+    // --- WIMT Offline Linear Schematic State (Option A / Pillar 1) ---
+    val isWimtLinearMode = MutableStateFlow(false)
+    fun toggleTrackingViewMode() { isWimtLinearMode.value = !isWimtLinearMode.value }
+
+
+    private val _offlineRoute = MutableStateFlow<GovtRoute?>(null)
+    val offlineRoute: StateFlow<GovtRoute?> = _offlineRoute.asStateFlow()
+
+    private val _offlineStages = MutableStateFlow<List<RouteStageSegment>>(emptyList())
+    val offlineStages: StateFlow<List<RouteStageSegment>> = _offlineStages.asStateFlow()
+
+    val offlineDistanceMeters = MutableStateFlow(124800.0) // Sample live bus progress at milestone 124.8 km
+
+    init {
+        viewModelScope.launch {
+            // Load default UK-DDO-01 Route 101 or first available from Room DB
+            offlineTransitDao.getAllRoutes().collect { routes ->
+                _offlineRoute.value = routes.firstOrNull()
+                routes.firstOrNull()?.let { firstRoute ->
+                    offlineTransitDao.getStagesForRoute(firstRoute.routeId).collect { stages ->
+                        _offlineStages.value = stages
+                    }
+                }
+            }
+        }
+    }
+
+    private val stompClient: StompClient = Stomp.over(Stomp.ConnectionProvider.OKHTTP, BuildConfig.WEBSOCKET_URL)
+    private val compositeDisposable = CompositeDisposable()
+    private var routeDisposable: Disposable? = null
+    private var simulationJob: Job? = null
+
+    private val _activeBuses = MutableStateFlow<List<ActiveBus>>(emptyList())
+    val activeBuses: StateFlow<List<ActiveBus>> = _activeBuses.asStateFlow()
+
+    private val realBuses = java.util.concurrent.ConcurrentHashMap<String, ActiveBus>()
+
+    private val _busLocation = MutableStateFlow<LatLng?>(transitRepository.getActiveRoute()?.initialBusLocation)
+    val busLocation: StateFlow<LatLng?> = _busLocation.asStateFlow()
+
+    private val _routeWaypoints = MutableStateFlow(transitRepository.getActiveRoute()?.waypoints ?: emptyList())
+    val routeWaypoints: StateFlow<List<LatLng>> = _routeWaypoints.asStateFlow()
+
+    private val _userStopLocation = MutableStateFlow(transitRepository.getActiveRoute()?.userStopLocation ?: transitRepository.getSelectedCity().centerLatLng)
+    val userStopLocation: StateFlow<LatLng> = _userStopLocation.asStateFlow()
+
+    private val _routeDetails = MutableStateFlow(
+        RouteDetails(
+            routeName = transitRepository.getActiveRoute()?.displayName ?: "No Route Selected",
+            destination = transitRepository.getActiveRoute()?.destination ?: "Pick from Plan Trip",
+            direction = transitRepository.getActiveRoute()?.direction ?: "${transitRepository.getSelectedCity().name} (${transitRepository.getSelectedCity().defaultLocationName})"
+        )
+    )
+    val routeDetails: StateFlow<RouteDetails> = _routeDetails.asStateFlow()
+
+    private val _eta = MutableStateFlow(5)
+    val eta: StateFlow<Int> = _eta.asStateFlow()
+
+    private val _distance = MutableStateFlow(1.2)
+    val distance: StateFlow<Double> = _distance.asStateFlow()
+
+    private val _busStatus = MutableStateFlow(BusStatus.ON_TIME)
+    val busStatus: StateFlow<BusStatus> = _busStatus.asStateFlow()
+
+    private val _isAlertActive = MutableStateFlow(false)
+    val isAlertActive: StateFlow<Boolean> = _isAlertActive.asStateFlow()
+
+    init {
+        stompClient.connect()
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            kotlinx.coroutines.flow.combine(
+                transitRepository.activeRouteId,
+                transitRepository.selectedCityId
+            ) { routeId, cityId ->
+                Pair(transitRepository.getActiveRoute(), transitRepository.getSelectedCity())
+            }.collect { (route, city) ->
+                if (route != null) {
+                    realBuses.clear()
+                    _busLocation.value = route.initialBusLocation
+                    _userStopLocation.value = route.userStopLocation
+                    _routeWaypoints.value = route.waypoints
+                    _routeDetails.value = RouteDetails(
+                        routeName = route.displayName,
+                        destination = route.destination,
+                        direction = route.direction
+                    )
+                    subscribeToRouteTopic(route.stompTopic)
+                    startSimulating()
+                } else {
+                    _busLocation.value = null
+                    _userStopLocation.value = city.centerLatLng
+                    _routeWaypoints.value = emptyList()
+                    _activeBuses.value = emptyList()
+                    _routeDetails.value = RouteDetails(
+                        routeName = "No Route Selected",
+                        destination = "Pick from Plan Trip",
+                        direction = "${city.name} (${city.defaultLocationName})"
+                    )
+                    routeDisposable?.dispose()
+                    simulationJob?.cancel()
+                }
+            }
+        }
+    }
+
+    fun startSimulating() {
+        simulationJob?.cancel()
+        val activeRoute = transitRepository.getActiveRoute() ?: return
+        fetchDirectionsForActiveRoute(activeRoute)
+        simulationJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            val baseBusId = activeRoute.busId
+            val bus2Id = if (baseBusId.contains("-")) baseBusId.substringBeforeLast("-") + "-" + (baseBusId.substringAfterLast("-").toIntOrNull()?.plus(48) ?: "4100") else "${baseBusId}-B2"
+            val bus3Id = if (baseBusId.contains("-")) baseBusId.substringBeforeLast("-") + "-" + (baseBusId.substringAfterLast("-").toIntOrNull()?.plus(170) ?: "4222") else "${baseBusId}-B3"
+
+            val totalMinutes = activeRoute.stops.lastOrNull()?.estimatedMinutesFromStart ?: 25
+            val totalDistance = activeRoute.stops.lastOrNull()?.distanceKm ?: 12.0
+
+            var seg1 = 0; var prog1 = 0.6
+            var seg2 = 0; var prog2 = 0.3
+            var seg3 = 0; var prog3 = 0.05
+
+            while (true) {
+                kotlinx.coroutines.delay(1200)
+                val waypoints = _routeWaypoints.value
+                if (waypoints.size >= 2) {
+                    val maxSeg = waypoints.size - 1
+
+                    // Update Bus 1 (Primary / Closest) simulated movement
+                    prog1 += 0.25; if (prog1 >= 1.0) { prog1 = 0.0; seg1 = (seg1 + 1) % maxSeg }
+                    val s1 = waypoints[seg1]; val e1 = waypoints[kotlin.math.min(seg1 + 1, maxSeg)]
+                    val loc1 = LatLng(s1.latitude + (e1.latitude - s1.latitude) * prog1, s1.longitude + (e1.longitude - s1.longitude) * prog1)
+                    val ratio1 = (1.0 - (seg1 + prog1) / maxSeg).coerceIn(0.04, 1.0)
+                    val rem1 = kotlin.math.max(1, kotlin.math.round(ratio1 * totalMinutes).toInt())
+                    val dist1 = kotlin.math.round((ratio1 * totalDistance) * 10) / 10.0
+                    val simB1 = ActiveBus(baseBusId, loc1, rem1, dist1, BusStatus.ON_TIME)
+
+                    // Update Bus 2 (Following) simulated movement
+                    prog2 += 0.20; if (prog2 >= 1.0) { prog2 = 0.0; seg2 = (seg2 + 1) % maxSeg }
+                    val s2 = waypoints[seg2]; val e2 = waypoints[kotlin.math.min(seg2 + 1, maxSeg)]
+                    val loc2 = LatLng(s2.latitude + (e2.latitude - s2.latitude) * prog2, s2.longitude + (e2.longitude - s2.longitude) * prog2)
+                    val rem2 = rem1 + 9
+                    val dist2 = kotlin.math.round((dist1 + 3.2) * 10) / 10.0
+                    val simB2 = ActiveBus(bus2Id, loc2, rem2, dist2, BusStatus.DELAYED)
+
+                    // Update Bus 3 (Queue) simulated movement
+                    prog3 += 0.18; if (prog3 >= 1.0) { prog3 = 0.0; seg3 = (seg3 + 1) % maxSeg }
+                    val s3 = waypoints[seg3]; val e3 = waypoints[kotlin.math.min(seg3 + 1, maxSeg)]
+                    val loc3 = LatLng(s3.latitude + (e3.latitude - s3.latitude) * prog3, s3.longitude + (e3.longitude - s3.longitude) * prog3)
+                    val rem3 = rem2 + 11
+                    val dist3 = kotlin.math.round((dist2 + 4.1) * 10) / 10.0
+                    val simB3 = ActiveBus(bus3Id, loc3, rem3, dist3, BusStatus.ON_TIME)
+
+                    val b1 = realBuses[baseBusId] ?: simB1
+                    val b2 = realBuses[bus2Id] ?: simB2
+                    val b3 = realBuses[bus3Id] ?: simB3
+
+                    val simulatedList = listOf(b1, b2, b3)
+                    val otherRealBuses = realBuses.values.filter { it.busId != baseBusId && it.busId != bus2Id && it.busId != bus3Id }
+                    val combinedList = (simulatedList + otherRealBuses).sortedBy { it.etaMinutes }
+
+                    _activeBuses.value = combinedList
+                    _busLocation.value = combinedList.firstOrNull()?.location
+                    _eta.value = combinedList.firstOrNull()?.etaMinutes ?: rem1
+                    _distance.value = combinedList.firstOrNull()?.distanceKm ?: dist1
+
+                    // --- Option B / Pillar 2 & 4: Zero-Cost Polyline Snapping & WIMT Progress Math ---
+                    val primaryBusLoc = combinedList.firstOrNull()?.location ?: loc1
+                    val snappedDistanceMeters = TransitPhysicsEngine.snapToRoutePolyline(primaryBusLoc, waypoints)
+                    
+                    // If waypoints are present, update offline 1D progress; otherwise simulate along total corridor
+                    if (snappedDistanceMeters > 10.0) {
+                        offlineDistanceMeters.value = snappedDistanceMeters
+                    } else {
+                        // Advance fractional progress along our 275 km Dehradun-Haldwani corridor or 22 km Bhimtal coach route
+                        val maxRouteLen = _offlineRoute.value?.totalDistanceMeters ?: 275000.0
+                        offlineDistanceMeters.value = ((1.0 - ratio1) * maxRouteLen).coerceIn(0.0, maxRouteLen)
+                    }
+
+                    // Compute terrain-aware ETA for upcoming stage (uphill vs downhill profile)
+                    _offlineStages.value.firstOrNull { it.accumulatedDistanceMeters > offlineDistanceMeters.value }?.let { nextStage ->
+                        val offlineEtaMins = TransitPhysicsEngine.calculateETA(offlineDistanceMeters.value, nextStage.accumulatedDistanceMeters, nextStage)
+                        if (offlineEtaMins > 0) _eta.value = offlineEtaMins
+                    }
+                }
+            }
+        }
+    }
+
+    private fun fetchDirectionsForActiveRoute(route: com.example.livebus.data.TransitRoute) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                // Check if we have an offline encoded polyline from Room DB first (Zero-Cost API replacement)
+                val offlineEncoded = _offlineRoute.value?.encodedPolyline
+                if (!offlineEncoded.isNullOrBlank() && offlineEncoded.length > 20) {
+                    val decodedPolyline = TransitPhysicsEngine.decodePolyline(offlineEncoded)
+                    if (decodedPolyline.isNotEmpty()) {
+                        _routeWaypoints.value = decodedPolyline
+                        return@launch
+                    }
+                }
+
+                val apiKey = com.example.livebus.BuildConfig.MAPS_API_KEY
+                if (apiKey.isNotBlank() && !apiKey.contains("PASTE_YOUR")) {
+                    val origin = "${route.initialBusLocation.latitude},${route.initialBusLocation.longitude}"
+                    val dest = "${route.userStopLocation.latitude},${route.userStopLocation.longitude}"
+                    val urlStr = "https://maps.googleapis.com/maps/api/directions/json?origin=$origin&destination=$dest&mode=driving&key=$apiKey"
+                    val url = java.net.URL(urlStr)
+                    val conn = url.openConnection() as java.net.HttpURLConnection
+                    conn.requestMethod = "GET"
+                    conn.connectTimeout = 5000
+                    conn.readTimeout = 5000
+
+                    if (conn.responseCode == 200) {
+                        val response = conn.inputStream.bufferedReader().use { it.readText() }
+                        val json = JSONObject(response)
+                        val routes = json.optJSONArray("routes")
+                        if (routes != null && routes.length() > 0) {
+                            val overviewPolyline = routes.getJSONObject(0).optJSONObject("overview_polyline")
+                            val pointsStr = overviewPolyline?.optString("points")
+                            if (!pointsStr.isNullOrBlank()) {
+                                val decoded = decodePolyline(pointsStr)
+                                if (decoded.size > 2) {
+                                    _routeWaypoints.value = decoded
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                println("Directions API fetch error, using default waypoints: ${e.message}")
+            }
+        }
+    }
+
+    private fun decodePolyline(encoded: String): List<LatLng> {
+        val poly = ArrayList<LatLng>()
+        var index = 0
+        val len = encoded.length
+        var lat = 0
+        var lng = 0
+        while (index < len) {
+            var b: Int
+            var shift = 0
+            var result = 0
+            do {
+                b = encoded[index++].code - 63
+                result = result or ((b and 0x1f) shl shift)
+                shift += 5
+            } while (b >= 0x20)
+            val dlat = if ((result and 1) != 0) (result shr 1).inv() else (result shr 1)
+            lat += dlat
+            shift = 0
+            result = 0
+            do {
+                b = encoded[index++].code - 63
+                result = result or ((b and 0x1f) shl shift)
+                shift += 5
+            } while (b >= 0x20)
+            val dlng = if ((result and 1) != 0) (result shr 1).inv() else (result shr 1)
+            lng += dlng
+            poly.add(LatLng(lat / 1E5, lng / 1E5))
+        }
+        return poly
+    }
+
+    private fun subscribeToRouteTopic(topic: String) {
+        routeDisposable?.dispose()
+        routeDisposable = stompClient.topic(topic)
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .map { it.payload }
+            .subscribe(Consumer { payload ->
+                viewModelScope.launch {
+                    parseAndApplyMessage(payload)
+                }
+            }, Consumer { error ->
+                println("Error subscribing to STOMP topic: ${error.message}")
+            })
+    }
+
+    fun parseAndApplyMessage(payload: String) {
+        try {
+            val json = JSONObject(payload)
+            val lat = json.getDouble("latitude")
+            val lon = json.getDouble("longitude")
+            val busId = json.optString("busId", transitRepository.getActiveRoute()?.busId ?: "TG-09-Z-4052")
+            val eta = if (json.has("eta")) json.getInt("eta") else _eta.value
+            val dist = if (json.has("distance")) json.getDouble("distance") else _distance.value
+            val status = if (json.has("status")) BusStatus.valueOf(json.getString("status")) else BusStatus.ON_TIME
+
+            val newBus = ActiveBus(busId, LatLng(lat, lon), eta, dist, status)
+            realBuses[busId] = newBus
+            refreshBusesList()
+        } catch (e: Exception) {
+            println("Error parsing STOMP payload: ${e.message}")
+        }
+    }
+
+    private fun refreshBusesList() {
+        val activeRoute = transitRepository.getActiveRoute() ?: return
+        val baseBusId = activeRoute.busId
+        val bus2Id = if (baseBusId.contains("-")) baseBusId.substringBeforeLast("-") + "-" + (baseBusId.substringAfterLast("-").toIntOrNull()?.plus(48) ?: "4100") else "${baseBusId}-B2"
+        val bus3Id = if (baseBusId.contains("-")) baseBusId.substringBeforeLast("-") + "-" + (baseBusId.substringAfterLast("-").toIntOrNull()?.plus(170) ?: "4222") else "${baseBusId}-B3"
+
+        val currentList = _activeBuses.value
+        val simulatedBuses = currentList.filter { it.busId == baseBusId || it.busId == bus2Id || it.busId == bus3Id }
+
+        val b1 = realBuses[baseBusId] ?: simulatedBuses.find { it.busId == baseBusId } ?: ActiveBus(baseBusId, activeRoute.initialBusLocation, 25, 12.0, BusStatus.ON_TIME)
+        val b2 = realBuses[bus2Id] ?: simulatedBuses.find { it.busId == bus2Id } ?: ActiveBus(bus2Id, activeRoute.initialBusLocation, 34, 15.2, BusStatus.DELAYED)
+        val b3 = realBuses[bus3Id] ?: simulatedBuses.find { it.busId == bus3Id } ?: ActiveBus(bus3Id, activeRoute.initialBusLocation, 45, 19.3, BusStatus.ON_TIME)
+
+        val simulatedList = listOf(b1, b2, b3)
+        val otherRealBuses = realBuses.values.filter { it.busId != baseBusId && it.busId != bus2Id && it.busId != bus3Id }
+        val combinedList = (simulatedList + otherRealBuses).sortedBy { it.etaMinutes }
+
+        _activeBuses.value = combinedList
+        _busLocation.value = combinedList.firstOrNull()?.location
+        _eta.value = combinedList.firstOrNull()?.etaMinutes ?: b1.etaMinutes
+        _distance.value = combinedList.firstOrNull()?.distanceKm ?: b1.distanceKm
+        _busStatus.value = combinedList.firstOrNull()?.status ?: b1.status
+    }
+
+    fun toggleAlert() {
+        _isAlertActive.value = !_isAlertActive.value
+    }
+
+    override fun onCleared() {
+        compositeDisposable.dispose()
+        stompClient.disconnect()
+        super.onCleared()
+    }
+}

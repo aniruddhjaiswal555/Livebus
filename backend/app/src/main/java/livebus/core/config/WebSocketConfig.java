@@ -1,0 +1,35 @@
+package livebus.core.config;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.messaging.simp.config.MessageBrokerRegistry;
+import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
+import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
+import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
+
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+        String rabbitMqHost = System.getenv("RABBITMQ_HOST");
+        if (rabbitMqHost != null && !rabbitMqHost.isEmpty()) {
+            int port = Integer.parseInt(System.getenv().getOrDefault("RABBITMQ_PORT", "61613"));
+            String user = System.getenv().getOrDefault("RABBITMQ_USERNAME", "guest");
+            String pass = System.getenv().getOrDefault("RABBITMQ_PASSWORD", "guest");
+            config.enableStompBrokerRelay("/topic")
+                  .setRelayHost(rabbitMqHost)
+                  .setRelayPort(port)
+                  .setClientLogin(user)
+                  .setClientPasscode(pass);
+        } else {
+            config.enableSimpleBroker("/topic");
+        }
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        
+        registry.addEndpoint("/ws-livebus").setAllowedOriginPatterns("*").withSockJS();
+    }
+}
